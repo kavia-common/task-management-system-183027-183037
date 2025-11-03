@@ -320,6 +320,11 @@ async function handleApiRequest(req, res, operation) {
   }
 }
 
+ // Health endpoint for quick reachability checks
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok' });
+});
+
 // API Routes - existing viewer
 app.get('/api/databases', async (req, res) => {
   const available = await testConnections();
@@ -491,10 +496,21 @@ const envInfo = {
   MongoDB: 'MONGODB_URL, MONGODB_DB'
 };
 
-// Start server on PORT env or default 4000
+ // Start server on PORT env or default 4000
 const PORT = process.env.PORT || 4000;
+
+// Log resolved configuration summary before starting
+const sqliteConfigured = !!(env && env.SQLITE_DB);
+if (sqliteConfigured) {
+  console.log(`SQLite configured with SQLITE_DB=${env.SQLITE_DB}`);
+} else {
+  console.log('SQLite is not configured (SQLITE_DB not set). Tasks API will return 500 until configured.');
+}
+
 app.listen(PORT, () => {
-  console.log(`Database viewer + Tasks API running on http://localhost:${PORT}`);
+  console.log(`Database viewer + Tasks API running`);
+  console.log(`- Listening on http://localhost:${PORT}`);
+  console.log(`- Health check: GET http://localhost:${PORT}/health`);
   console.log('\nEnvironment variables expected:');
   Object.entries(envInfo).forEach(([db, vars]) => {
     console.log(`${db}: ${vars}`);
