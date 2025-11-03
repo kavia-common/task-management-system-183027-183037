@@ -30,6 +30,9 @@ else:
 conn = sqlite3.connect(DB_NAME)
 cursor = conn.cursor()
 
+# Enable foreign keys pragma (good practice even if not used yet)
+cursor.execute("PRAGMA foreign_keys = ON")
+
 # Create initial schema
 cursor.execute("""
     CREATE TABLE IF NOT EXISTS app_info (
@@ -49,6 +52,25 @@ cursor.execute("""
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
 """)
+
+# Create tasks table for to-do application
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS tasks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT NOT NULL,
+        completed INTEGER NOT NULL DEFAULT 0,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+""")
+
+# Optional seed of sample tasks if table empty
+cursor.execute("SELECT COUNT(*) FROM tasks")
+task_count = cursor.fetchone()[0]
+if task_count == 0:
+    cursor.execute("INSERT INTO tasks (title, completed) VALUES (?, ?)", ("Welcome to your To-Do List", 0))
+    cursor.execute("INSERT INTO tasks (title, completed) VALUES (?, ?)", ("Click to toggle completion", 0))
+    cursor.execute("INSERT INTO tasks (title, completed) VALUES (?, ?)", ("You can edit or delete tasks", 0))
 
 # Insert initial data
 cursor.execute("INSERT OR REPLACE INTO app_info (key, value) VALUES (?, ?)", 

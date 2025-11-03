@@ -23,6 +23,7 @@ app.use((req, res, next) => {
   }
   next();
 });
+app.use(express.json()); // parse JSON bodies
 app.use(express.static(path.join(__dirname, 'public')));
 
 // Load environment variables from .env files
@@ -127,7 +128,7 @@ class DatabaseAdapter {
 
 // SQL-based adapter base class
 class SQLAdapter extends DatabaseAdapter {
-  async execute(query) {
+  async execute(query, params = []) {
     throw new Error('Not implemented');
   }
   
@@ -155,10 +156,10 @@ class SQLAdapter extends DatabaseAdapter {
 
 // PostgreSQL adapter
 class PostgresAdapter extends SQLAdapter {
-  async execute(query) {
+  async execute(query, params = []) {
     const pool = new Pool(this.config);
     try {
-      const result = await pool.query(query);
+      const result = await pool.query(query, params);
       return result.rows;
     } finally {
       await pool.end();
@@ -176,10 +177,10 @@ class PostgresAdapter extends SQLAdapter {
 
 // MySQL adapter
 class MySQLAdapter extends SQLAdapter {
-  async execute(query) {
+  async execute(query, params = []) {
     const connection = await mysql.createConnection(this.config);
     try {
-      const [rows] = await connection.execute(query);
+      const [rows] = await connection.execute(query, params);
       return rows;
     } finally {
       await connection.end();
@@ -197,12 +198,22 @@ class MySQLAdapter extends SQLAdapter {
 
 // SQLite adapter
 class SQLiteAdapter extends SQLAdapter {
-  execute(query) {
+  execute(query, params = []) {
     return new Promise((resolve, reject) => {
       const db = new sqlite3.Database(this.config.path);
-      db.all(query, (err, rows) => {
+      db.all(query, params, (err, rows) => {
         if (err) reject(err);
         else resolve(rows);
+        db.close();
+      });
+    });
+  }
+  run(query, params = []) {
+    return new Promise((resolve, reject) => {
+      const db = new sqlite3.Database(this.config.path);
+      db.run(query, params, function (err) {
+        if (err) reject(err);
+        else resolve({ changes: this.changes, lastID: this.lastID });
         db.close();
       });
     });
@@ -294,7 +305,7 @@ async function testConnections() {
   return available;
 }
 
-// Generic API handler
+// Generic API handler for multi-DB browsing (existing viewer routes)
 async function handleApiRequest(req, res, operation) {
   try {
     const adapter = adapters[req.params.db];
@@ -309,7 +320,7 @@ async function handleApiRequest(req, res, operation) {
   }
 }
 
-// API Routes
+// API Routes - existing viewer
 app.get('/api/databases', async (req, res) => {
   const available = await testConnections();
   res.json(available);
@@ -326,6 +337,148 @@ app.get('/api/:db/tables/:table/data', (req, res) =>
   })
 );
 
+// ToDo REST API (SQLite only) - CRUD endpoints under /api/tasks
+function getSQLiteAdapterOrError(res) {
+  const sqliteAdapter = adapters.sqlite;
+  if (!sqliteAdapter || !sqliteAdapter.config || !sqliteAdapter.config.path) {
+    res.status(500).json({ error: 'SQLite is not configured. Ensure SQLITE_DB is set in sqlite.env.' });
+    return null;
+  }
+  return sqliteAdapter;
+}
+
+// GET /api/tasks - list all tasks ordered by created_at DESC
+app.get('/api/tasks', async (req, res) => {
+  const sqliteAdapter = getSQLiteAdapterOrError(res);
+  if (!sqliteAdapter) return;
+  try {
+    const rows = await sqliteAdapter.execute(
+      'SELECT id, title, completed, created_at, updated_at FROM tasks ORDER BY datetime(created_at) DESC'
+    );
+    res.json(rows.map(r => ({ ...r, completed: Number(r.completed) === 1 })));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/tasks - create a task { title }
+app.post('/api/tasks', async (req, res) => {
+  const sqliteAdapter = getSQLiteAdapterOrError(res);
+  if (!sqliteAdapter) return;
+  const { title } = req.body || {};
+  if (!title || typeof title !== 'string' || title.trim() === '') {
+    return res.status(400).json({ error: 'title is required' });
+  }
+  try {
+    const result = await sqliteAdapter.run(
+      'INSERT INTO tasks (title, completed, created_at, updated_at) VALUES (?, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)',
+      [title.trim()]
+    );
+    const rows = await sqliteAdapter.execute(
+      'SELECT id, title, completed, created_at, updated_at FROM tasks WHERE id = ?',
+      [result.lastID]
+    );
+    const task = rows[0];
+    task.completed = Number(task.completed) === 1;
+    res.status(201).json(task);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PUT /api/tasks/:id - update title and/or completed
+app.put('/api/tasks/:id', async (req, res) => {
+  const sqliteAdapter = getSQLiteAdapterOrError(res);
+  if (!sqliteAdapter) return;
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'invalid id' });
+
+  const { title, completed } = req.body || {};
+  const fields = [];
+  const params = [];
+
+  if (typeof title === 'string') {
+    fields.push('title = ?');
+    params.push(title.trim());
+  }
+  if (typeof completed === 'boolean') {
+    fields.push('completed = ?');
+    params.push(completed ? 1 : 0);
+  }
+
+  if (fields.length === 0) {
+    return res.status(400).json({ error: 'nothing to update' });
+  }
+
+  try {
+    params.push(id);
+    const result = await sqliteAdapter.run(
+      `UPDATE tasks SET ${fields.join(', ')}, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+      params
+    );
+    if (result.changes === 0) return res.status(404).json({ error: 'task not found' });
+
+    const rows = await sqliteAdapter.execute(
+      'SELECT id, title, completed, created_at, updated_at FROM tasks WHERE id = ?',
+      [id]
+    );
+    if (!rows || rows.length === 0) return res.status(404).json({ error: 'task not found' });
+    const task = rows[0];
+    task.completed = Number(task.completed) === 1;
+    res.json(task);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PATCH /api/tasks/:id/toggle - flip completed
+app.patch('/api/tasks/:id/toggle', async (req, res) => {
+  const sqliteAdapter = getSQLiteAdapterOrError(res);
+  if (!sqliteAdapter) return;
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'invalid id' });
+
+  try {
+    // Get current value
+    const rows = await sqliteAdapter.execute('SELECT completed FROM tasks WHERE id = ?', [id]);
+    if (!rows || rows.length === 0) return res.status(404).json({ error: 'task not found' });
+
+    const newCompleted = Number(rows[0].completed) === 1 ? 0 : 1;
+    const result = await sqliteAdapter.run(
+      'UPDATE tasks SET completed = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+      [newCompleted, id]
+    );
+    if (result.changes === 0) return res.status(404).json({ error: 'task not found' });
+
+    const updated = await sqliteAdapter.execute(
+      'SELECT id, title, completed, created_at, updated_at FROM tasks WHERE id = ?',
+      [id]
+    );
+    const task = updated[0];
+    task.completed = Number(task.completed) === 1;
+    res.json(task);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// DELETE /api/tasks/:id - delete task
+app.delete('/api/tasks/:id', async (req, res) => {
+  const sqliteAdapter = getSQLiteAdapterOrError(res);
+  if (!sqliteAdapter) return;
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'invalid id' });
+
+  try {
+    const result = await sqliteAdapter.run('DELETE FROM tasks WHERE id = ?', [id]);
+    if (result.changes === 0) return res.status(404).json({ error: 'task not found' });
+    res.status(204).send();
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Root keeps existing UI
 app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
@@ -338,9 +491,10 @@ const envInfo = {
   MongoDB: 'MONGODB_URL, MONGODB_DB'
 };
 
-const PORT = process.env.PORT || 3000;
+// Start server on PORT env or default 4000
+const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {
-  console.log(`Database viewer running on http://localhost:${PORT}`);
+  console.log(`Database viewer + Tasks API running on http://localhost:${PORT}`);
   console.log('\nEnvironment variables expected:');
   Object.entries(envInfo).forEach(([db, vars]) => {
     console.log(`${db}: ${vars}`);
